@@ -33,7 +33,9 @@ import time
 import gzip
 import bz2
 import tempfile
+import re
 
+from six import string_types
 from debian import deb822
 
 from . import compressr
@@ -73,8 +75,9 @@ class AptRepoMeta(object):
         self.release.setdefault('Components', ' '.join(components))
         codename = self.release.setdefault('Codename', codename or 'foo')
         self.release.setdefault('Suite', codename)
-        self.release.setdefault('Description', description or codename)
-        origin = self.release.setdefault('Origin', origin or codename)
+        default = codename.capitalize()
+        self.release.setdefault('Description', description or default)
+        origin = self.release.setdefault('Origin', origin or default)
         self.release.setdefault('Label', label or origin)
         self.release.setdefault('Version', version or REPO_VERSION)
         self.set_date()
@@ -99,14 +102,14 @@ class AptRepoMeta(object):
     def components(self):
         return self.release.get('Components', '').split()
 
+    @components.setter
+    def components(self, values):
+        assert isinstance(values, list)
+        self.release['Components'] = ' '.join(values)
+
     @property
     def codename(self):
         return self.release.get('Codename')
-
-    @components.setter
-    def _set_components(self, values):
-        assert isinstance(values, list)
-        self.release['Components'] = ' '.join(values)
 
     def init_component_arch_binaries(self):
         self._component_arch_binaries = []
@@ -127,7 +130,7 @@ class AptRepoMeta(object):
             meta=dict(component=component, architecture=architecture))
 
     def component_arch_binary_package_files_from_release(self):
-        digests = ['SHA256', 'SHA1', 'MD5']
+        digests = ['SHA256', 'SHA1', 'MD5sum']
         ret = dict()
         for digest_name in digests:
             if digest_name not in self.release:
@@ -141,7 +144,7 @@ class AptRepoMeta(object):
                     comparch = (comp, arch)
                     if comparch in ret:
                         continue
-                    path = os.path.join(comp, 'binary-{}'.format(arch))
+                    path = os.path.join(re.sub(r'^.*/', '', comp), 'binary-{}'.format(arch))
                     if path not in comp_arch_bin_packages:
                         continue
                     ret[comparch] = comp_arch_bin_packages[path]
@@ -163,14 +166,19 @@ class AptRepoMeta(object):
         self._component_arch_binaries.append(obj)
         return obj
 
+    def release_dir(self, base_path):
+        return os.path.join(
+            base_path, 'dists', self.release['Codename'])
+
     def release_path(self, base_path):
         return os.path.join(
-            base_path, 'dists', self.release['Codename'], 'Release')
+            self.release_dir(base_path), 'Release')
 
     def create(self, base_path):
         all_checksums = dict()
         for obj in self.iter_component_arch_binaries():
-            checksums = obj.write_Packages(base_path)
+            checksums = obj.write_packages(
+                base_path, self.release_dir(base_path))
             for k, vlist in checksums.items():
                 all_checksums.setdefault(k, []).extend(vlist)
         self.release.update(all_checksums)
@@ -189,7 +197,8 @@ class AptRepoMeta(object):
                             self.metadata.release['Codename'])
 
     @classmethod
-    def Write_Packages(cls, base_path, relative_path_fname, packages):
+    def WritePackages(cls, base_path, release_dir,
+                      relative_path_fname, packages):
         """
         packages: iterator of objects with a dump() method (debpkg.DebPkg or
         deb822.Packages)
@@ -198,7 +207,7 @@ class AptRepoMeta(object):
                        relative_path_fname + '.gz',
                        relative_path_fname + '.bz2',
                        ]
-        pkg_files = [os.path.join(base_path, x) for x in short_names]
+        pkg_files = [os.path.join(release_dir, x) for x in short_names]
         utils.makedirs(os.path.dirname(pkg_files[0]))
 
         pkg_plain, pkg_gz, pkg_bz2 = pkg_files
@@ -234,7 +243,7 @@ class AptRepoMeta(object):
         HA = cls._Hash_Algorithms
         checksums = dict()
         for relative_fname in short_names:
-            src = os.path.join(base_path, relative_fname)
+            src = os.path.join(release_dir, relative_fname)
             hashes = hash_file(src, algs=HA)
             size = str(os.stat(src).st_size)
             common = dict(name=relative_fname, size=size)
@@ -379,10 +388,11 @@ class ComponentArchBinary(object):
         utils.makedirs(os.path.dirname(path))
         self.release.dump(open(path, "wb"))
 
-    def write_Packages(self, base_path):
-        pkgs_relative_path = self.relative_path('Packages')
-        pkg_files, checksums = AptRepoMeta.Write_Packages(
-            base_path, pkgs_relative_path, self.iter_packages())
+    def write_packages(self, base_path, release_dir):
+        pkgs_relative_path = os.path.join(
+            self.component, 'binary-{}'.format(self.architecture), 'Packages')
+        pkg_files, checksums = AptRepoMeta.WritePackages(
+            base_path, release_dir, pkgs_relative_path, self.iter_packages())
         return checksums
 
 
@@ -496,7 +506,7 @@ class AptRepo(object):
             utils.DownloadRequest(release_file, dest, data=None))
         try:
             cls.download([req])
-        except:
+        except:  # noqa: E722
             log.error('Failed to open %s', release_file, exc_info=True)
             raise
         meta = AptRepoMeta(release=open(dest, "rb"), upstream_url=path)
@@ -512,18 +522,21 @@ class AptRepo(object):
         return repoobj
 
 
-def create_repo(path, files, name=None, components=None,
-                arches=None, desc=None, with_symlinks=False):
+def create_repo(path, files, codename=None, components=None,
+                arches=None, desc=None, origin=None, label=None,
+                with_symlinks=False):
     if arches is not None:
-        if isinstance(arches, str):
-            arches = [arches]
-        if isinstance(components, str):
-            components = [components]
-    meta = AptRepoMeta(codename=name,
-                       components=components,
-                       architectures=arches,
-                       description=desc)
-    repo = AptRepo(path, meta)
+        if isinstance(arches, string_types):
+            arches = [x for x in arches.split() if x]
+        if isinstance(components, string_types):
+            components = [x for x in components.split() if x]
+    metadata = AptRepoMeta(origin=origin,
+                           label=label,
+                           codename=codename,
+                           components=components,
+                           architectures=arches,
+                           description=desc)
+    repo = AptRepo(path, metadata=metadata)
     repo.create(files, with_symlinks=with_symlinks)
     return repo
 

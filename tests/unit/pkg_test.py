@@ -17,10 +17,12 @@
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-from __future__ import unicode_literals
+# Don't use unicode_literals, it breaks test_dump_different_encodings because
+# python-debian expects py2 strings or py3 strings, not py2 unicode
 
 from collections import namedtuple
 from debian import deb822
+from debian import debfile
 from debpkgr.debpkg import DebPkg
 from debpkgr.debpkg import DebPkgFiles
 from debpkgr.debpkg import DebPkgMD5sums
@@ -63,10 +65,11 @@ class PkgTest(base.BaseTestCase):
 
         self.files_data = sorted([x for x in self.hashes_data.keys()])
 
-        self.md5sum_string = 'MD5sum 5fc5c0cb24690e78d6c6a2e13753f1aa\n'\
-                             'SHA1 5e26ae3ebf9f7176bb7fd01c9e802ac8e223cdcc\n'\
-                             'SHA256 d80568c932f54997713bb7832c6da6aa04992919'\
-                             'f3d0f47afb6ba600a7586780\n'
+        self.md5sum_string = '''\
+MD5sum: 5fc5c0cb24690e78d6c6a2e13753f1aa
+SHA1: 5e26ae3ebf9f7176bb7fd01c9e802ac8e223cdcc
+SHA256: d80568c932f54997713bb7832c6da6aa04992919f3d0f47afb6ba600a7586780
+'''
 
         self.files_string = 'usr/share/doc/foo/README.Debian\n'\
                             'usr/share/doc/foo/changelog.Debian.gz\n'\
@@ -93,11 +96,11 @@ class PkgTest(base.BaseTestCase):
     def test_pkg(self):
         pkg = DebPkg(self.control_data, self.md5sum_data, self.hashes_data)
         for k, v in self.attrs_data.items():
-            self.assertEquals(getattr(pkg, k), v)
+            self.assertEqual(getattr(pkg, k), v)
         # Make sure the hashes are not part of the control file
         for k in pkg.hashes:
             self.assertFalse(k in pkg._c)
-        self.assertEquals(pkg.package, self.package_obj)
+        self.assertEqual(pkg.package, self.package_obj)
         # Make sure the hashes are still not part of the control file
         for k in pkg.hashes:
             self.assertFalse(k in pkg._c)
@@ -107,18 +110,19 @@ class PkgTest(base.BaseTestCase):
     def test_pkg_md5sums(self):
         md5sums = DebPkgMD5sums(self.md5sum_data)
         for k, v in self.md5sum_data.items():
-            self.assertEquals(md5sums[k], v)
-        self.assertEquals(str(md5sums), self.md5sum_string)
-        # assert md5sums == False
+            self.assertEqual(md5sums[k], v)
+        self.assertEqual(
+            sorted(str(md5sums).split('\n')),
+            sorted(self.md5sum_string.split('\n')))
 
     def test_pkg_files(self):
         files = DebPkgFiles(self.files_data)
-        self.assertEquals([x for x in files], self.files_data)
-        self.assertEquals(files, self.files_data)
-        self.assertNotEquals(files, self.attrs_data)
-        self.assertNotEquals(files, self.hashes_data)
-        self.assertEquals(str(files), self.files_string)
-        self.assertNotEquals(str(files), self.files_string_bad)
+        self.assertEqual([x for x in files], self.files_data)
+        self.assertEqual(files, self.files_data)
+        self.assertNotEqual(files, self.attrs_data)
+        self.assertNotEqual(files, self.hashes_data)
+        self.assertEqual(str(files), self.files_string)
+        self.assertNotEqual(str(files), self.files_string_bad)
         # assert files == False
 
     def test_pkg_requires(self):
@@ -384,8 +388,8 @@ class PkgTest(base.BaseTestCase):
                         u'suggests': []}
 
         pkg = DebPkg(control_data, self.md5sum_data, self.hashes_data)
-        self.assertEquals(dependencies, pkg.dependencies)
-        self.assertEquals(dependencies['depends'], pkg.depends)
+        self.assertEqual(dependencies, pkg.dependencies)
+        self.assertEqual(dependencies['depends'], pkg.depends)
 
     def test_pkg_versions(self):
         expected = (
@@ -442,11 +446,38 @@ class PkgTest(base.BaseTestCase):
                      (line.partition(': ') for line in lines))
         # Make sure the original dict is included
         for k, v in meta.items():
-            self.assertEquals(v, ldict[k])
+            self.assertEqual(v, ldict[k])
 
     @base.mock.patch("debpkgr.debpkg.debfile.DebFile")
     def test_pkg_from_file_with_Filename(self, _DebFile):
         _DebFile.return_value.control.debcontrol.return_value = {}
         Filename = "pool/comp/a_1.deb"
         dp = DebPkg.from_file("/dev/null", Filename=Filename)
-        self.assertEquals(Filename, dp._c['Filename'])
+        self.assertEqual(Filename, dp._c['Filename'])
+
+    @base.mock.patch("debpkgr.debpkg.debfile.DebFile")
+    @base.mock.patch("debpkgr.debpkg.log.warn")
+    def test_pkg_from_file_without_md5sums(self, _log_warn, _DebFile):
+        meta = dict(package="a", version="1", architecture="amd64")
+        _DebFile.return_value.control.debcontrol.return_value = meta
+        args = "'md5sums' file not found, can't list MD5 sums"
+        _DebFile.return_value.md5sums.side_effect = debfile.DebError(args)
+        dp = DebPkg.from_file("/dev/null")
+        _DebFile.return_value.md5sums.assert_called_once_with(encoding='utf-8')
+        self.assertTrue(_log_warn.call_count == 1)
+        self.assertEqual(dp.md5sums, DebPkgMD5sums())
+
+    def test_dump_different_encodings(self):
+        """
+        Make sure we can dump in a different encoding that the original one
+        """
+        srcenc = 'iso-8859-1'
+        obj = DebPkgMD5sums({'\xed': 'i'}, encoding=srcenc)
+        self.assertEqual(
+            b'\xed: i\n'.decode(srcenc),
+            obj.dump(encoding='utf-8'))
+
+    def test_Deb822_str(self):
+        "Verify that __str__ returns a string, and not unicode in python2"
+        obj = ({'a': 'a'})
+        self.assertTrue(isinstance(obj.__str__(), str))
